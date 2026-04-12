@@ -1,5 +1,4 @@
 import pandas as pd
-import faiss
 import numpy as np
 import os
 import json
@@ -16,14 +15,16 @@ class Recommender:
         # =========================
         self.df = pd.read_csv(csv_path)
 
-        # Create unified text field
+        # Create unified text field and force robust text-only inputs.
         self.df["product_text"] = (
-            self.df["name"].fillna("") + " " +
-            self.df["category"].fillna("") + " " +
-            self.df["desc"].fillna("") + " " +
-            self.df["color"].fillna("")
+            self.df["name"].fillna("").astype(str) + " " +
+            self.df["category"].fillna("").astype(str) + " " +
+            self.df["desc"].fillna("").astype(str) + " " +
+            self.df["color"].fillna("").astype(str)
         )
-
+        self.df["product_text"] = self.df["product_text"].map(
+            lambda x: x if isinstance(x, str) else str(x)
+        )
         # =========================
         # 2. LOAD EMBEDDING MODEL
         # =========================
@@ -41,14 +42,46 @@ class Recommender:
         api_key = os.getenv("GROQ_API_KEY")
         self.client = Groq(api_key=api_key) if api_key else None
 
-        # Build embeddings once
-        self.embeddings = self.model.encode(
-            self.df["product_text"].tolist()
-        ).astype("float32")
+        # Build embeddings once and reuse for all requests.
+        texts = self.df["product_text"].tolist()
+        self.embeddings = self.model.encode(texts).astype("float32")
 
-        # FAISS index
-        self.index = faiss.IndexFlatL2(self.embeddings.shape[1])
-        self.index.add(self.embeddings)
+    @staticmethod
+    def _topk_l2_indices(query_vec, candidate_embeddings, k):
+        if candidate_embeddings.shape[0] == 0:
+            return np.array([], dtype=np.int64)
+
+        k = min(int(k), int(candidate_embeddings.shape[0]))
+        if k <= 0:
+            return np.array([], dtype=np.int64)
+
+        # Exact squared L2 distance, same metric used by IndexFlatL2.
+        dists = np.sum((candidate_embeddings - query_vec) ** 2, axis=1)
+
+        if k == candidate_embeddings.shape[0]:
+            return np.argsort(dists)
+
+        topk_unsorted = np.argpartition(dists, k - 1)[:k]
+        return topk_unsorted[np.argsort(dists[topk_unsorted])]
+
+    @staticmethod
+    def _json_safe_value(value):
+        if isinstance(value, np.generic):
+            value = value.item()
+
+        if isinstance(value, float) and not np.isfinite(value):
+            return None
+
+        if pd.isna(value):
+            return None
+
+        if isinstance(value, dict):
+            return {k: Recommender._json_safe_value(v) for k, v in value.items()}
+
+        if isinstance(value, list):
+            return [Recommender._json_safe_value(v) for v in value]
+
+        return value
 
     # =========================
     # 4. GROQ QUERY PROCESSOR
@@ -158,7 +191,10 @@ class Recommender:
 
         english_query = str(parsed.get("query", query)).strip()
         query = english_query.lower()
-        category = str(parsed.get("category", "") or "")
+        raw_category = parsed.get("category", "")
+        category = "" if raw_category is None else str(raw_category).strip()
+        if category.lower() in {"none", "null", "nan"}:
+            category = ""
 
         print(f"[Recommender] Original query: {original_query}")
         print(f"[Recommender] English query used: {english_query}")
@@ -169,35 +205,27 @@ class Recommender:
         # STEP 2: CATEGORY FILTER
         # -------------------------
         if category:
-            filtered_df = self.df[
-                self.df["category"].str.lower().str.contains(category.lower(), na=False)
-            ]
+            mask = self.df["category"].str.lower().str.contains(category.lower(), na=False)
+            candidate_indices = np.flatnonzero(mask.to_numpy())
         else:
-            filtered_df = self.df
+            candidate_indices = np.arange(len(self.df), dtype=np.int64)
 
         # fallback if empty
-        if len(filtered_df) == 0:
-            filtered_df = self.df
+        if candidate_indices.size == 0:
+            candidate_indices = np.arange(len(self.df), dtype=np.int64)
 
         # -------------------------
-        # STEP 3: EMBEDDINGS FOR FILTERED DATA
+        # STEP 3: SEARCH IN PRECOMPUTED EMBEDDINGS
         # -------------------------
-        texts = filtered_df["product_text"].tolist()
-        embeddings = self.model.encode(texts).astype("float32")
-
-        index = faiss.IndexFlatL2(embeddings.shape[1])
-        index.add(embeddings)
-
-        # -------------------------
-        # STEP 4: SEARCH
-        # -------------------------
-        query_vec = self.model.encode([query]).astype("float32")
-
-        _, indices = index.search(query_vec, k)
+        query_vec = self.model.encode([query]).astype("float32")[0]
+        candidate_embeddings = self.embeddings[candidate_indices]
+        local_topk = self._topk_l2_indices(query_vec, candidate_embeddings, k)
+        global_topk = candidate_indices[local_topk]
 
         results = []
-        for i in indices[0]:
-            results.append(filtered_df.iloc[i].to_dict())
+        for idx in global_topk:
+            row_dict = self.df.iloc[int(idx)].to_dict()
+            results.append(self._json_safe_value(row_dict))
 
         # -------------------------
         # FINAL OUTPUT
@@ -205,6 +233,6 @@ class Recommender:
         return {
             "original_query": original_query,
             "english_query_used": english_query,
-            "groq_parsed": parsed,
+            "groq_parsed": self._json_safe_value(parsed),
             "results": results
         }

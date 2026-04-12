@@ -1,49 +1,53 @@
 from fastapi import FastAPI
 from urllib.parse import parse_qs, unquote, urlparse
 from recommender import Recommender
-from fastapi.middleware.cors import CORSMiddleware
+from traslator import roman_urdu_to_english
 
 app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # later restrict to your wordpress domain
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 recommender = Recommender("final_dataset.csv")
 
 
-def _normalize_query(q: str) -> str:
-    raw = (q or "").strip()
-    if not raw:
-        return raw
+def _normalize_query_input(q: str) -> str:
+    value = (q or "").strip()
+    decoded = unquote(value)
 
-    decoded = unquote(raw)
+    # Handle accidental nested input like '/recommend?q=joote hai?'.
+    if decoded.lower().startswith("/recommend") or "?q=" in decoded.lower():
+        parsed = urlparse(decoded)
+        query_dict = parse_qs(parsed.query)
+        nested_q = query_dict.get("q", [])
+        if nested_q and nested_q[0].strip():
+            return nested_q[0].strip()
 
-    # If the user accidentally sends the entire endpoint in q,
-    # extract only the nested q value.
-    for candidate in (decoded, raw):
-        if "/recommend?" in candidate or "recommend?q=" in candidate:
-            target = candidate if "://" in candidate else f"http://local{candidate}"
-            parsed = urlparse(target)
-            nested_q = parse_qs(parsed.query).get("q", [""])[0]
-            nested_q = unquote(nested_q).strip()
-            if nested_q:
-                return nested_q
-
-    if decoded.lower().startswith("q="):
-        return decoded[2:].strip()
+        marker = decoded.lower().find("q=")
+        if marker != -1:
+            return decoded[marker + 2 :].strip()
 
     return decoded
 
+
 @app.get("/")
 def home():
-    return {"message": "API running"}
+    return {
+        "message": "Recommendation API is running",
+        "recommend_endpoint": "/recommend?q=your+query",
+    }
+
 
 @app.get("/recommend")
 def recommend(q: str):
-    clean_q = _normalize_query(q)
-    return recommender.recommend(clean_q)
+    clean_query = _normalize_query_input(q)
+
+    # STEP 1: convert Roman Urdu → English
+    english_query = roman_urdu_to_english(clean_query)
+
+    # STEP 2: get recommendations
+    results = recommender.recommend(english_query)
+
+    # STEP 3: return JSON for WordPress
+    return {
+        "original_query": clean_query,
+        "english_query": english_query,
+        "results": results
+    }
