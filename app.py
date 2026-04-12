@@ -1,3 +1,4 @@
+from functools import lru_cache
 from fastapi import FastAPI
 from urllib.parse import parse_qs, unquote, urlparse
 from recommender import Recommender
@@ -5,7 +6,12 @@ from traslator import roman_urdu_to_english
 
 app = FastAPI()
 
-recommender = Recommender("final_dataset.csv")
+DATASET_SOURCE = "https://drive.google.com/file/d/1T-j0zvmUSHKHaWW4t2XdqRCylnEefcGz/view"
+
+
+@lru_cache(maxsize=1)
+def get_recommender() -> Recommender:
+    return Recommender(DATASET_SOURCE)
 
 
 def _normalize_query_input(q: str) -> str:
@@ -43,7 +49,7 @@ def recommend(q: str):
     english_query = roman_urdu_to_english(clean_query)
 
     # STEP 2: get recommendations
-    results = recommender.recommend(english_query)
+    results = get_recommender().recommend(english_query)
 
     # STEP 3: return JSON for WordPress
     return {

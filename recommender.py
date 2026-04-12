@@ -1,53 +1,99 @@
-import pandas as pd
-import numpy as np
-import os
 import json
+import os
 import re
-from groq import Groq
-from sentence_transformers import SentenceTransformer
+import shutil
+import tempfile
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 
 class Recommender:
-    def __init__(self, csv_path):
+    def __init__(self, dataset_source):
+        self.dataset_source = dataset_source
+        self.df = None
+        self.vectorizer = None
+        self.text_matrix = None
+        self._groq_client = None
+        self._resolved_dataset_path = None
 
-        # =========================
-        # 1. LOAD DATASET
-        # =========================
-        self.df = pd.read_csv(csv_path)
-
-        # Create unified text field and force robust text-only inputs.
-        self.df["product_text"] = (
-            self.df["name"].fillna("").astype(str) + " " +
-            self.df["category"].fillna("").astype(str) + " " +
-            self.df["desc"].fillna("").astype(str) + " " +
-            self.df["color"].fillna("").astype(str)
-        )
-        self.df["product_text"] = self.df["product_text"].map(
-            lambda x: x if isinstance(x, str) else str(x)
-        )
-        # =========================
-        # 2. LOAD EMBEDDING MODEL
-        # =========================
-        self.model = SentenceTransformer("all-MiniLM-L6-v2")
-
-        # =========================
-        # 3. GROQ SETUP
-        # =========================
         self.groq_models = list(dict.fromkeys([
             os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
             "llama-3.3-70b-versatile",
             "llama-3.1-8b-instant",
             "mixtral-8x7b-32768",
         ]))
-        api_key = os.getenv("GROQ_API_KEY")
-        self.client = Groq(api_key=api_key) if api_key else None
 
-        # Build embeddings once and reuse for all requests.
-        texts = self.df["product_text"].tolist()
-        self.embeddings = self.model.encode(texts).astype("float32")
+    def _load_dependencies(self):
+        import numpy as np
+        import pandas as pd
+
+        if self.df is None:
+            self.df = pd.read_csv(self._resolve_dataset_path())
+
+            self.df["product_text"] = (
+                self.df["name"].fillna("").astype(str) + " " +
+                self.df["category"].fillna("").astype(str) + " " +
+                self.df["desc"].fillna("").astype(str) + " " +
+                self.df["color"].fillna("").astype(str)
+            )
+            self.df["product_text"] = self.df["product_text"].map(
+                lambda x: x if isinstance(x, str) else str(x)
+            )
+
+        if self.vectorizer is None or self.text_matrix is None:
+            from sklearn.feature_extraction.text import TfidfVectorizer
+
+            self.vectorizer = TfidfVectorizer(
+                lowercase=True,
+                stop_words="english",
+                ngram_range=(1, 2),
+                max_features=50000,
+            )
+            self.text_matrix = self.vectorizer.fit_transform(self.df["product_text"].tolist())
+
+        return np, pd
+
+    def _get_groq_client(self):
+        if self._groq_client is None:
+            api_key = os.getenv("GROQ_API_KEY")
+            if not api_key:
+                self._groq_client = False
+            else:
+                from groq import Groq
+
+                self._groq_client = Groq(api_key=api_key)
+
+        return None if self._groq_client is False else self._groq_client
+
+    def _resolve_dataset_path(self):
+        if self._resolved_dataset_path is not None:
+            return self._resolved_dataset_path
+
+        source = (self.dataset_source or "").strip()
+        if source.startswith(("http://", "https://")):
+            download_url = source
+            parsed = urlparse(source)
+
+            if "drive.google.com" in parsed.netloc and "/file/d/" in parsed.path:
+                match = re.search(r"/file/d/([^/]+)", parsed.path)
+                if match:
+                    file_id = match.group(1)
+                    download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+
+            request = Request(download_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(request) as response:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as temp_file:
+                    shutil.copyfileobj(response, temp_file)
+                    self._resolved_dataset_path = temp_file.name
+        else:
+            self._resolved_dataset_path = source
+
+        return self._resolved_dataset_path
 
     @staticmethod
     def _topk_l2_indices(query_vec, candidate_embeddings, k):
+        import numpy as np
+
         if candidate_embeddings.shape[0] == 0:
             return np.array([], dtype=np.int64)
 
@@ -66,6 +112,9 @@ class Recommender:
 
     @staticmethod
     def _json_safe_value(value):
+        import numpy as np
+        import pandas as pd
+
         if isinstance(value, np.generic):
             value = value.item()
 
@@ -120,6 +169,7 @@ class Recommender:
         return None
 
     def process_query_with_groq(self, query):
+        client = self._get_groq_client()
 
         prompt = f"""
         You are an AI assistant for a product recommender system.
@@ -138,14 +188,14 @@ class Recommender:
         {query}
         """
 
-        if not self.client:
+        if not client:
             print("[Groq] GROQ_API_KEY not found in current server environment. Using raw query.")
             return {"query": query, "category": ""}
 
         for model_name in self.groq_models:
             try:
                 print(f"[Groq] Trying model: {model_name}")
-                response = self.client.chat.completions.create(
+                response = client.chat.completions.create(
                     model=model_name,
                     temperature=0,
                     messages=[
@@ -182,6 +232,7 @@ class Recommender:
     # 5. MAIN RECOMMEND FUNCTION (UPDATED)
     # =========================
     def recommend(self, query, k=5):
+        np, _ = self._load_dependencies()
 
         # -------------------------
         # STEP 1: Groq processing
@@ -217,10 +268,21 @@ class Recommender:
         # -------------------------
         # STEP 3: SEARCH IN PRECOMPUTED EMBEDDINGS
         # -------------------------
-        query_vec = self.model.encode([query]).astype("float32")[0]
-        candidate_embeddings = self.embeddings[candidate_indices]
-        local_topk = self._topk_l2_indices(query_vec, candidate_embeddings, k)
-        global_topk = candidate_indices[local_topk]
+        query_vec = self.vectorizer.transform([query])
+        candidate_matrix = self.text_matrix[candidate_indices]
+        similarities = (candidate_matrix @ query_vec.T).toarray().ravel()
+
+        if similarities.size == 0:
+            global_topk = np.array([], dtype=np.int64)
+        else:
+            k = min(int(k), int(similarities.shape[0]))
+            if k <= 0:
+                global_topk = np.array([], dtype=np.int64)
+            elif k == similarities.shape[0]:
+                global_topk = candidate_indices[np.argsort(-similarities)]
+            else:
+                topk_unsorted = np.argpartition(-similarities, k - 1)[:k]
+                global_topk = candidate_indices[topk_unsorted[np.argsort(-similarities[topk_unsorted])]]
 
         results = []
         for idx in global_topk:
