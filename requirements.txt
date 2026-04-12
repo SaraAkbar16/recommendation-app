@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+faiss-cpu
+pandas
+numpy
+torch
+sentence-transformers
+groq
+pillow
+groq
