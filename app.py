@@ -3,9 +3,15 @@ from fastapi import FastAPI
 from urllib.parse import parse_qs, unquote, urlparse
 from recommender import Recommender
 from traslator import roman_urdu_to_english
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
-
+app.add_middleware(
+      CORSMiddleware,
+      allow_origins=["*"],
+      allow_methods=["GET"],
+      allow_headers=["*"],
+)
 DATASET_SOURCE = "https://drive.google.com/file/d/1T-j0zvmUSHKHaWW4t2XdqRCylnEefcGz/view"
 
 
