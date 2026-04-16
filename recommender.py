@@ -8,6 +8,15 @@ from urllib.request import Request, urlopen
 
 
 class Recommender:
+    LOW_CONFIDENCE_THRESHOLD = 0.7
+    LOW_CONFIDENCE_MESSAGE = "cant find the product you want but we have similar products maybe you will like them"
+    FULL_COVERAGE_WEIGHT = 0.4
+    NAME_COVERAGE_WEIGHT = 0.6
+    QUERY_NOISE_TERMS = {
+        "available", "availability", "avail", "have", "has", "stock", "instock",
+        "in", "is", "are", "do", "you", "your", "pass", "please", "any"
+    }
+
     def __init__(self, dataset_source):
         self.dataset_source = dataset_source
         self.df = None
@@ -131,6 +140,19 @@ class Recommender:
             return [Recommender._json_safe_value(v) for v in value]
 
         return value
+
+    @staticmethod
+    def _normalize_search_query(query):
+        cleaned = re.sub(r"[^a-zA-Z0-9\s]", " ", str(query or "").lower())
+        tokens = [t for t in cleaned.split() if t]
+        filtered = [t for t in tokens if t not in Recommender.QUERY_NOISE_TERMS]
+        if filtered:
+            return " ".join(filtered), filtered
+        return " ".join(tokens), tokens
+
+    @staticmethod
+    def _tokenize_text(value):
+        return [t for t in re.sub(r"[^a-zA-Z0-9\s]", " ", str(value or "").lower()).split() if t]
 
     # =========================
     # 4. GROQ QUERY PROCESSOR
@@ -268,9 +290,28 @@ class Recommender:
         # -------------------------
         # STEP 3: SEARCH IN PRECOMPUTED EMBEDDINGS
         # -------------------------
-        query_vec = self.vectorizer.transform([query])
-        candidate_matrix = self.text_matrix[candidate_indices]
-        similarities = (candidate_matrix @ query_vec.T).toarray().ravel()
+        normalized_query, query_terms = self._normalize_search_query(query)
+        if not normalized_query.strip():
+            normalized_query = query
+
+        # Pure lexical similarity score (no cosine) as requested.
+        similarities = np.zeros(candidate_indices.shape[0], dtype=float)
+        if similarities.size > 0 and query_terms:
+            for local_idx, global_idx in enumerate(candidate_indices):
+                row = self.df.iloc[int(global_idx)]
+                name_tokens = set(self._tokenize_text(row.get("name", "")))
+                full_tokens = set(self._tokenize_text(row.get("product_text", "")))
+
+                matched_in_full = sum(1 for term in query_terms if term in full_tokens)
+                matched_in_name = sum(1 for term in query_terms if term in name_tokens)
+
+                full_coverage = matched_in_full / len(query_terms)
+                name_coverage = matched_in_name / len(query_terms)
+
+                similarities[local_idx] = (
+                    self.FULL_COVERAGE_WEIGHT * float(full_coverage)
+                    + self.NAME_COVERAGE_WEIGHT * float(name_coverage)
+                )
 
         if similarities.size == 0:
             global_topk = np.array([], dtype=np.int64)
@@ -285,9 +326,27 @@ class Recommender:
                 global_topk = candidate_indices[topk_unsorted[np.argsort(-similarities[topk_unsorted])]]
 
         results = []
-        for idx in global_topk:
+        top_similarity = None
+        for rank, idx in enumerate(global_topk):
             row_dict = self.df.iloc[int(idx)].to_dict()
+            local_pos = np.where(candidate_indices == idx)[0]
+            similarity_score = None
+            if local_pos.size > 0:
+                local_i = int(local_pos[0])
+                similarity_score = float(similarities[local_i])
+                if rank == 0:
+                    top_similarity = similarity_score
+
+            row_dict["similarity_score"] = similarity_score
             results.append(self._json_safe_value(row_dict))
+
+        if top_similarity is None and similarities.size > 0:
+            top_similarity = float(np.max(similarities))
+
+        applied_threshold = self.LOW_CONFIDENCE_THRESHOLD
+        message = ""
+        if top_similarity is None or top_similarity < applied_threshold:
+            message = self.LOW_CONFIDENCE_MESSAGE
 
         # -------------------------
         # FINAL OUTPUT
@@ -295,6 +354,10 @@ class Recommender:
         return {
             "original_query": original_query,
             "english_query_used": english_query,
+            "normalized_query_used": normalized_query,
             "groq_parsed": self._json_safe_value(parsed),
+            "message": message,
+            "top_similarity": self._json_safe_value(top_similarity),
+            "threshold": applied_threshold,
             "results": results
         }
