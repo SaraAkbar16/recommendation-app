@@ -62,3 +62,18 @@ Recommendation example:
 
 - The app logs original query and English query used for search in terminal.
 - Keep API keys out of source files. Use environment variables only.
+
+## Troubleshooting: "Failed to fetch"
+
+If browser clients show:
+
+- `Failed to fetch`
+- `URL scheme must be "http" or "https" for CORS request`
+
+Check the following:
+
+- Always call the API with a full URL, for example:
+	- `https://recommendation-app-49z7.onrender.com/recommend?q=shoes`
+- Do not use URLs like `recommendation-app-49z7.onrender.com/recommend?...` (missing scheme).
+- If you want restricted CORS, set `CORS_ALLOWED_ORIGINS` as a comma-separated env var:
+	- `https://your-frontend.com,https://www.your-frontend.com`
